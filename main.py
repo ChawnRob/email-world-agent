@@ -150,67 +150,99 @@ class Agent:
         self.optimizer.step()
         return loss.item()
 
-    def simulate_action(self, state, action):
+    def rollout(self, state, first_action, horizon=3):
+        current_state = np.asarray(state, dtype=np.float32).copy()
+        total_score = 0.0
+        discount = 1.0
+        gamma = 0.85
+        trajectory = []
+
         with torch.no_grad():
-            state_t = torch.tensor(
-                np.asarray(state, dtype=np.float32), dtype=torch.float32
-            ).unsqueeze(0)
-            action_t = torch.tensor([action], dtype=torch.int64)
-            pred = self.model(state_t, action_t)
-        predicted_next_state = np.asarray(
-            pred.squeeze(0).cpu().numpy(), dtype=np.float32
-        )
+            for step in range(horizon):
+                if step == 0:
+                    action = first_action
+                else:
+                    action = max(
+                        range(4),
+                        key=lambda a: self.env.estimate_reward(current_state, a),
+                    )
 
-        similar = self.memory.retrieve(predicted_next_state, k=3)
-        immediate_reward = float(self.env.estimate_reward(state, action))
-        if similar:
-            memory_reward = float(np.mean([float(m[3]) for m in similar]))
-        else:
-            memory_reward = 0.0
+                state_t = torch.tensor(
+                    current_state, dtype=torch.float32
+                ).unsqueeze(0)
+                action_t = torch.tensor([action], dtype=torch.int64)
+                pred = self.model(state_t, action_t)
+                next_state = np.asarray(
+                    pred.squeeze(0).cpu().numpy(), dtype=np.float32
+                )
 
-        risk_raw = float(predicted_next_state[3])
-        urgency_raw = float(predicted_next_state[0])
-        risk_penalty = risk_raw * 0.3
-        urgency_penalty = urgency_raw * 0.2
-        final_score = (
-            immediate_reward
-            + 0.4 * memory_reward
-            - risk_penalty
-            - urgency_penalty
-        )
+                similar = self.memory.retrieve(next_state, k=3)
+                if similar:
+                    memory_reward = float(
+                        np.mean([float(m[3]) for m in similar])
+                    )
+                else:
+                    memory_reward = 0.0
+
+                immediate_reward = float(
+                    self.env.estimate_reward(current_state, action)
+                )
+                risk_penalty = float(next_state[3]) * 0.3
+                urgency_penalty = float(next_state[0]) * 0.2
+                step_score = (
+                    immediate_reward
+                    + 0.4 * memory_reward
+                    - risk_penalty
+                    - urgency_penalty
+                )
+
+                total_score += discount * step_score
+                discount *= gamma
+
+                trajectory.append(
+                    {
+                        "action_name": self.env.ACTIONS[action],
+                        "immediate_reward": immediate_reward,
+                        "memory_reward": memory_reward,
+                        "risk_penalty": risk_penalty,
+                        "urgency_penalty": urgency_penalty,
+                        "step_score": step_score,
+                        "next_state": next_state,
+                    }
+                )
+                current_state = next_state
 
         return {
-            "action": action,
-            "action_name": self.env.ACTIONS[action],
-            "state": np.asarray(state, dtype=np.float32),
-            "predicted_next_state": predicted_next_state,
-            "immediate_reward": immediate_reward,
-            "memory_reward": memory_reward,
-            "risk_penalty": risk_penalty,
-            "urgency_penalty": urgency_penalty,
-            "final_score": final_score,
-            "similar_count": len(similar),
+            "first_action": first_action,
+            "first_action_name": self.env.ACTIONS[first_action],
+            "total_score": total_score,
+            "trajectory": trajectory,
         }
 
-    def simulate_all_actions(self, state):
-        scenarios = [self.simulate_action(state, a) for a in range(4)]
-        scenarios.sort(key=lambda row: row["final_score"], reverse=True)
-        return scenarios
+    def rollout_all_actions(self, state, horizon=3):
+        rollouts = [self.rollout(state, a, horizon) for a in range(4)]
+        rollouts.sort(key=lambda r: r["total_score"], reverse=True)
+        return rollouts
 
     def decide(self, state):
-        scenarios = self.simulate_all_actions(state)
-        print("Scenario simulation:")
-        for row in sorted(scenarios, key=lambda r: r["action"]):
+        rollouts = self.rollout_all_actions(state, horizon=3)
+        print("Rollout simulation:")
+        for r in sorted(rollouts, key=lambda x: x["first_action"]):
             print(
-                f"- {row['action_name']} | immediate={row['immediate_reward']:.2f} | "
-                f"memory={row['memory_reward']:.2f} | risk={row['risk_penalty']:.2f} | "
-                f"final={row['final_score']:.2f}"
+                f"- {r['first_action_name']} | total={r['total_score']:.2f}"
             )
-        best = max(scenarios, key=lambda r: r["final_score"])
+            for si, step in enumerate(r["trajectory"]):
+                print(
+                    f"  step {si} -> action={step['action_name']} | "
+                    f"score={step['step_score']:.2f}"
+                )
+        best = max(rollouts, key=lambda r: r["total_score"])
+        final_predicted_state = best["trajectory"][-1]["next_state"]
         return (
-            best["action"],
-            best["final_score"],
-            best["predicted_next_state"],
+            best["first_action"],
+            best["total_score"],
+            final_predicted_state,
+            best,
         )
 
 
@@ -225,8 +257,9 @@ if __name__ == "__main__":
         state, _ = agent.env.reset()
         print(f"Epoch {epoch}")
         print(f"State: {np.round(state, 2)}")
-        action, _, predicted_next_state = agent.decide(state)
+        action, total_score, final_predicted_state, _ = agent.decide(state)
         print(f"Decision: {agent.env.ACTIONS[action]}")
-        print(f"Predicted next state: {np.round(predicted_next_state, 2)}")
+        print(f"Trajectory score: {total_score:.2f}")
+        print(f"Final predicted state: {np.round(final_predicted_state, 2)}")
         print(f"Loss: {loss}")
         print(f"Memory size: {len(agent.memory.storage)}")
