@@ -90,24 +90,24 @@ class WorldModel(nn.Module):
 class VectorMemory:
     def __init__(self, dim=6):
         self.dim = dim
-        self.index = faiss.IndexFlatL2(dim)
-        self.data = []
+        self.index = faiss.IndexFlatL2(6)
+        self.storage = []
 
-    def add(self, s, a, ns, r):
-        state_vec = np.array(s, dtype=np.float32).reshape(1, self.dim)
+    def add(self, state, action, next_state, reward):
+        state_vec = np.array(state, dtype=np.float32).reshape(1, self.dim)
         self.index.add(state_vec)
-        self.data.append((s, a, ns, r))
+        self.storage.append((state, action, next_state, reward))
 
     def retrieve(self, query_state, k=3):
-        if len(self.data) == 0:
+        if len(self.storage) == 0:
             return []
         query_vec = np.array(query_state, dtype=np.float32).reshape(1, self.dim)
-        top_k = min(k, len(self.data))
+        top_k = min(k, len(self.storage))
         _, indices = self.index.search(query_vec, top_k)
         results = []
         for idx in indices[0]:
             if idx != -1:
-                results.append(self.data[idx])
+                results.append(self.storage[idx])
         return results
 
 
@@ -131,16 +131,18 @@ class Agent:
             state = next_state
 
     def train(self):
-        if len(self.memory.data) < 32:
+        if len(self.memory.storage) < 32:
             return
-        batch = random.sample(self.memory.data, 32)
-        states_np = np.stack([b[0] for b in batch]).astype(np.float32)
-        actions_np = np.array([b[1] for b in batch], dtype=np.int64)
-        next_states_np = np.stack([b[2] for b in batch]).astype(np.float32)
-
-        states = torch.from_numpy(states_np)
-        actions = torch.from_numpy(actions_np)
-        next_states = torch.from_numpy(next_states_np)
+        batch = random.sample(self.memory.storage, 32)
+        states = torch.tensor(
+            np.array([b[0] for b in batch]), dtype=torch.float32
+        )
+        actions = torch.tensor(
+            np.array([b[1] for b in batch]), dtype=torch.int64
+        )
+        next_states = torch.tensor(
+            np.array([b[2] for b in batch]), dtype=torch.float32
+        )
         pred = self.model(states, actions)
         loss = self.loss_fn(pred, next_states)
         self.optimizer.zero_grad()
@@ -150,9 +152,9 @@ class Agent:
 
     def decide(self, state):
         state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        similar_memories = self.memory.retrieve(state, k=3)
+        memories = self.memory.retrieve(state, k=3)
         print("Similar memories:")
-        for memory in similar_memories:
+        for memory in memories:
             _, mem_action, _, mem_reward = memory
             print(
                 f"- action: {self.env.ACTIONS[mem_action]} | reward: {mem_reward:.2f}"
@@ -161,7 +163,12 @@ class Agent:
         for a in range(4):
             action_t = torch.tensor([a])
             self.model(state_t, action_t)
-            score = self.env.estimate_reward(state, a)
+            estimated = self.env.estimate_reward(state, a)
+            same_action_rewards = [m[3] for m in memories if m[1] == a]
+            if same_action_rewards:
+                score = estimated + (sum(same_action_rewards) / len(same_action_rewards)) * 0.3
+            else:
+                score = estimated
             results.append((a, score))
         best = max(results, key=lambda x: x[1])
         return best
@@ -176,11 +183,10 @@ if __name__ == "__main__":
         agent.collect()
         loss = agent.train()
         state, _ = agent.env.reset()
-        action, score = agent.decide(state)
-        print("=" * 50)
         print(f"Epoch {epoch}")
-        print(f"State: {np.round(state,2)}")
-        print(f"Action: {agent.env.ACTIONS[action]}")
+        print(f"State: {np.round(state, 2)}")
+        action, score = agent.decide(state)
         print(f"Decision: {agent.env.ACTIONS[action]}")
-        print(f"Score: {score:.3f}")
+        print(f"Score: {score:.2f}")
         print(f"Loss: {loss}")
+        print(f"Memory size: {len(agent.memory.storage)}")
