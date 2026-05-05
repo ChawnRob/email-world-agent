@@ -150,28 +150,68 @@ class Agent:
         self.optimizer.step()
         return loss.item()
 
+    def simulate_action(self, state, action):
+        with torch.no_grad():
+            state_t = torch.tensor(
+                np.asarray(state, dtype=np.float32), dtype=torch.float32
+            ).unsqueeze(0)
+            action_t = torch.tensor([action], dtype=torch.int64)
+            pred = self.model(state_t, action_t)
+        predicted_next_state = np.asarray(
+            pred.squeeze(0).cpu().numpy(), dtype=np.float32
+        )
+
+        similar = self.memory.retrieve(predicted_next_state, k=3)
+        immediate_reward = float(self.env.estimate_reward(state, action))
+        if similar:
+            memory_reward = float(np.mean([float(m[3]) for m in similar]))
+        else:
+            memory_reward = 0.0
+
+        risk_raw = float(predicted_next_state[3])
+        urgency_raw = float(predicted_next_state[0])
+        risk_penalty = risk_raw * 0.3
+        urgency_penalty = urgency_raw * 0.2
+        final_score = (
+            immediate_reward
+            + 0.4 * memory_reward
+            - risk_penalty
+            - urgency_penalty
+        )
+
+        return {
+            "action": action,
+            "action_name": self.env.ACTIONS[action],
+            "state": np.asarray(state, dtype=np.float32),
+            "predicted_next_state": predicted_next_state,
+            "immediate_reward": immediate_reward,
+            "memory_reward": memory_reward,
+            "risk_penalty": risk_penalty,
+            "urgency_penalty": urgency_penalty,
+            "final_score": final_score,
+            "similar_count": len(similar),
+        }
+
+    def simulate_all_actions(self, state):
+        scenarios = [self.simulate_action(state, a) for a in range(4)]
+        scenarios.sort(key=lambda row: row["final_score"], reverse=True)
+        return scenarios
+
     def decide(self, state):
-        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        memories = self.memory.retrieve(state, k=3)
-        print("Similar memories:")
-        for memory in memories:
-            _, mem_action, _, mem_reward = memory
+        scenarios = self.simulate_all_actions(state)
+        print("Scenario simulation:")
+        for row in sorted(scenarios, key=lambda r: r["action"]):
             print(
-                f"- action: {self.env.ACTIONS[mem_action]} | reward: {mem_reward:.2f}"
+                f"- {row['action_name']} | immediate={row['immediate_reward']:.2f} | "
+                f"memory={row['memory_reward']:.2f} | risk={row['risk_penalty']:.2f} | "
+                f"final={row['final_score']:.2f}"
             )
-        results = []
-        for a in range(4):
-            action_t = torch.tensor([a])
-            self.model(state_t, action_t)
-            estimated = self.env.estimate_reward(state, a)
-            same_action_rewards = [m[3] for m in memories if m[1] == a]
-            if same_action_rewards:
-                score = estimated + (sum(same_action_rewards) / len(same_action_rewards)) * 0.3
-            else:
-                score = estimated
-            results.append((a, score))
-        best = max(results, key=lambda x: x[1])
-        return best
+        best = max(scenarios, key=lambda r: r["final_score"])
+        return (
+            best["action"],
+            best["final_score"],
+            best["predicted_next_state"],
+        )
 
 
 # ============================================================
@@ -185,8 +225,8 @@ if __name__ == "__main__":
         state, _ = agent.env.reset()
         print(f"Epoch {epoch}")
         print(f"State: {np.round(state, 2)}")
-        action, score = agent.decide(state)
+        action, _, predicted_next_state = agent.decide(state)
         print(f"Decision: {agent.env.ACTIONS[action]}")
-        print(f"Score: {score:.2f}")
+        print(f"Predicted next state: {np.round(predicted_next_state, 2)}")
         print(f"Loss: {loss}")
         print(f"Memory size: {len(agent.memory.storage)}")
