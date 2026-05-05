@@ -112,13 +112,32 @@ class VectorMemory:
 
 
 # ============================================================
-# 4. ORCHESTRATOR
+# 4. GOAL SYSTEM
+# ============================================================
+class GoalSystem:
+    def evaluate_state_value(self, state):
+        u, s, i, r, d, c = np.asarray(state, dtype=np.float32).reshape(-1)[:6]
+        u, i, r, d, c = np.clip(np.array([u, i, r, d, c], dtype=np.float64), 0.0, 1.0)
+        s = float(np.clip(s, -1.0, 1.0))
+        return float(
+            (1.0 - u) * 0.35
+            + c * 0.3
+            + (1.0 - r) * 0.2
+            + i * 0.1
+            + (1.0 - d) * 0.05
+            + s * 0.05
+        )
+
+
+# ============================================================
+# 5. ORCHESTRATOR
 # ============================================================
 class Agent:
     def __init__(self):
         self.env = EmailEnv()
         self.model = WorldModel()
         self.memory = VectorMemory(dim=6)
+        self.goal_system = GoalSystem()
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.loss_fn = nn.MSELoss()
 
@@ -176,6 +195,8 @@ class Agent:
                     pred.squeeze(0).cpu().numpy(), dtype=np.float32
                 )
 
+                goal_value = self.goal_system.evaluate_state_value(next_state)
+
                 similar = self.memory.retrieve(next_state, k=3)
                 if similar:
                     memory_reward = float(
@@ -192,6 +213,7 @@ class Agent:
                 step_score = (
                     immediate_reward
                     + 0.4 * memory_reward
+                    + 0.6 * goal_value
                     - risk_penalty
                     - urgency_penalty
                 )
@@ -204,6 +226,7 @@ class Agent:
                         "action_name": self.env.ACTIONS[action],
                         "immediate_reward": immediate_reward,
                         "memory_reward": memory_reward,
+                        "goal_value": goal_value,
                         "risk_penalty": risk_penalty,
                         "urgency_penalty": urgency_penalty,
                         "step_score": step_score,
@@ -234,6 +257,9 @@ class Agent:
             for si, step in enumerate(r["trajectory"]):
                 print(
                     f"  step {si} -> action={step['action_name']} | "
+                    f"immediate={step['immediate_reward']:.2f} | "
+                    f"memory={step['memory_reward']:.2f} | "
+                    f"goal={step['goal_value']:.2f} | "
                     f"score={step['step_score']:.2f}"
                 )
         best = max(rollouts, key=lambda r: r["total_score"])
@@ -247,7 +273,7 @@ class Agent:
 
 
 # ============================================================
-# 5. MAIN
+# 6. MAIN
 # ============================================================
 if __name__ == "__main__":
     agent = Agent()
@@ -258,8 +284,12 @@ if __name__ == "__main__":
         print(f"Epoch {epoch}")
         print(f"State: {np.round(state, 2)}")
         action, total_score, final_predicted_state, _ = agent.decide(state)
+        final_goal_value = agent.goal_system.evaluate_state_value(
+            final_predicted_state
+        )
         print(f"Decision: {agent.env.ACTIONS[action]}")
         print(f"Trajectory score: {total_score:.2f}")
+        print(f"Final goal value: {final_goal_value:.2f}")
         print(f"Final predicted state: {np.round(final_predicted_state, 2)}")
         print(f"Loss: {loss}")
         print(f"Memory size: {len(agent.memory.storage)}")
