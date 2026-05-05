@@ -106,6 +106,16 @@ class StrategicMemory:
             "risk_high": float(s[3]) > 0.6,
         }
 
+    def context_similarity(self, ctx1, ctx2):
+        score = 0
+        total = len(ctx1)
+        if total == 0:
+            return 1.0
+        for key in ctx1:
+            if ctx1[key] == ctx2[key]:
+                score += 1
+        return score / total
+
     def maybe_create_rule(self, action, state):
         stat = self.stats[action]
         avg = stat["sum"] / stat["count"]
@@ -139,11 +149,20 @@ class StrategicMemory:
         self.rules.append(lesson)
 
     def match(self, state):
-        context = self.extract_context(state)
+        current_context = self.extract_context(state)
         matched = []
         for rule in self.rules:
-            if rule["context"] == context:
-                matched.append(rule)
+            sim = self.context_similarity(rule["context"], current_context)
+            if sim > 0.66:
+                weighted_confidence = rule["confidence"] * sim
+                matched.append(
+                    {
+                        "action": rule["action"],
+                        "rule": rule["rule"],
+                        "confidence": weighted_confidence,
+                        "similarity": sim,
+                    }
+                )
         return matched
 
 
@@ -186,12 +205,17 @@ class Agent:
                 np.mean([m[3] for m in memories]) if memories else 0
             )
             rules = self.long_memory.match(current_state)
-            print("Matched rules:", rules)
+            for r in rules:
+                print(
+                    f"Rule → action {r['action']} | {r['rule']} | "
+                    f"conf={round(r['confidence'], 2)} | "
+                    f"sim={round(r['similarity'], 2)}"
+                )
             penalty = 0
             for r in rules:
-                if r["action"] == action and r["rule"] == "avoid":
+                if r["rule"] == "avoid":
                     penalty -= r["confidence"]
-                if r["action"] == action and r["rule"] == "prefer":
+                elif r["rule"] == "prefer":
                     penalty += r["confidence"]
             score = memory_reward + penalty
             total_score += score
