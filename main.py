@@ -98,33 +98,53 @@ class StrategicMemory:
         self.stats[action]["count"] += 1
         self.stats[action]["sum"] += reward
 
-    def maybe_create_rule(self, action):
+    def extract_context(self, state):
+        s = np.asarray(state).reshape(-1)
+        return {
+            "importance_high": float(s[2]) > 0.6,
+            "urgency_high": float(s[0]) > 0.6,
+            "risk_high": float(s[3]) > 0.6,
+        }
+
+    def maybe_create_rule(self, action, state):
         stat = self.stats[action]
         avg = stat["sum"] / stat["count"]
         if stat["count"] < 5:
             return None
+        context = self.extract_context(state)
         if avg < -0.3:
             return {
                 "action": action,
                 "rule": "avoid",
                 "confidence": min(1.0, abs(avg)),
+                "context": context,
             }
         if avg > 0.5:
             return {
                 "action": action,
                 "rule": "prefer",
                 "confidence": min(1.0, avg),
+                "context": context,
             }
         return None
 
     def store(self, lesson):
         for r in self.rules:
-            if r["action"] == lesson["action"] and r["rule"] == lesson["rule"]:
+            if (
+                r["action"] == lesson["action"]
+                and r["rule"] == lesson["rule"]
+                and r["context"] == lesson["context"]
+            ):
                 return
         self.rules.append(lesson)
 
     def match(self, state):
-        return self.rules
+        context = self.extract_context(state)
+        matched = []
+        for rule in self.rules:
+            if rule["context"] == context:
+                matched.append(rule)
+        return matched
 
 
 # =========================
@@ -165,7 +185,8 @@ class Agent:
             memory_reward = (
                 np.mean([m[3] for m in memories]) if memories else 0
             )
-            rules = self.long_memory.match(state)
+            rules = self.long_memory.match(current_state)
+            print("Matched rules:", rules)
             penalty = 0
             for r in rules:
                 if r["action"] == action and r["rule"] == "avoid":
@@ -218,7 +239,7 @@ class Agent:
         next_state, reward = self.env.real_outcome(state, action)
         self.memory.add(state, action, next_state, reward)
         self.long_memory.update_stats(action, reward)
-        lesson = self.long_memory.maybe_create_rule(action)
+        lesson = self.long_memory.maybe_create_rule(action, state)
         if lesson:
             self.long_memory.store(lesson)
         return next_state, reward
