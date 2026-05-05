@@ -115,18 +115,61 @@ class VectorMemory:
 # 4. GOAL SYSTEM
 # ============================================================
 class GoalSystem:
+    def __init__(self):
+        self.weights = {
+            "client_satisfaction": 0.25,
+            "risk_reduction": 0.25,
+            "urgency_control": 0.25,
+            "confidence_growth": 0.25,
+        }
+        self.normalize_weights()
+
+    def normalize_weights(self):
+        total = sum(self.weights.values())
+        for key in self.weights:
+            self.weights[key] = self.weights[key] / total
+
     def evaluate_state_value(self, state):
-        u, s, i, r, d, c = np.asarray(state, dtype=np.float32).reshape(-1)[:6]
-        u, i, r, d, c = np.clip(np.array([u, i, r, d, c], dtype=np.float64), 0.0, 1.0)
-        s = float(np.clip(s, -1.0, 1.0))
-        return float(
-            (1.0 - u) * 0.35
-            + c * 0.3
-            + (1.0 - r) * 0.2
-            + i * 0.1
-            + (1.0 - d) * 0.05
-            + s * 0.05
-        )
+        vec = np.asarray(state, dtype=np.float64).reshape(-1)
+        u = float(vec[0])
+        sentiment = float(vec[1])
+        importance = float(vec[2])
+        risk = float(vec[3])
+        confidence = float(vec[5])
+        signals = {
+            "client_satisfaction": ((sentiment + 1) / 2) * importance,
+            "risk_reduction": 1 - risk,
+            "urgency_control": 1 - u,
+            "confidence_growth": confidence,
+        }
+        return float(sum(self.weights[k] * signals[k] for k in self.weights))
+
+    def update_weights(self, state, reward):
+        vec = np.asarray(state, dtype=np.float64).reshape(-1)
+        urgency = float(vec[0])
+        sentiment = float(vec[1])
+        importance = float(vec[2])
+        risk = float(vec[3])
+        confidence = float(vec[5])
+
+        signals = {
+            "client_satisfaction": ((sentiment + 1) / 2) * importance,
+            "risk_reduction": 1 - risk,
+            "urgency_control": 1 - urgency,
+            "confidence_growth": confidence,
+        }
+
+        learning_rate = 0.03
+
+        for key, signal in signals.items():
+            if reward > 0:
+                self.weights[key] += learning_rate * signal
+            else:
+                self.weights[key] -= learning_rate * signal
+
+            self.weights[key] = max(0.05, min(0.70, self.weights[key]))
+
+        self.normalize_weights()
 
 
 # ============================================================
@@ -271,6 +314,9 @@ class Agent:
             best,
         )
 
+    def learn_from_outcome(self, final_state, total_score):
+        self.goal_system.update_weights(final_state, total_score)
+
 
 # ============================================================
 # 6. MAIN
@@ -291,5 +337,14 @@ if __name__ == "__main__":
         print(f"Trajectory score: {total_score:.2f}")
         print(f"Final goal value: {final_goal_value:.2f}")
         print(f"Final predicted state: {np.round(final_predicted_state, 2)}")
+        agent.learn_from_outcome(final_predicted_state, total_score)
+        print("Adaptive weights:")
+        for wkey in (
+            "client_satisfaction",
+            "risk_reduction",
+            "urgency_control",
+            "confidence_growth",
+        ):
+            print(f"- {wkey}: {agent.goal_system.weights[wkey]:.3f}")
         print(f"Loss: {loss}")
         print(f"Memory size: {len(agent.memory.storage)}")
