@@ -1,5 +1,5 @@
-import random
 import os
+import random
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -10,468 +10,255 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+# =========================
+# ENV SIMULÉ
+# =========================
 
-# ============================================================
-# 1. EMAIL ENVIRONMENT
-# ============================================================
+
 class EmailEnv:
-    ACTIONS = {
-        0: "répondre maintenant",
-        1: "ignorer",
-        2: "validation humaine",
-        3: "relancer plus tard",
-    }
-
-    def __init__(self):
-        self.state_dim = 6
-        self.action_dim = 4
-        self.state = None
+    ACTIONS = ["répondre", "ignorer", "valider", "relancer"]
+    action_dim = 4
 
     def reset(self):
-        self.state = np.array(
-            [
-                np.random.rand(),  # urgence
-                np.random.uniform(-1, 1),  # sentiment
-                np.random.rand(),  # importance
-                np.random.rand(),  # risque
-                np.random.rand(),  # délai
-                np.random.rand(),  # confiance
-            ],
-            dtype=np.float32,
-        )
-        return self.state, {}
-
-    def estimate_reward(self, state, action):
-        u, s, i, r, d, c = state
-        if action == 0:
-            return u * 0.5 + i * 0.3 + c * 0.2 - r * 0.2
-        if action == 1:
-            return -u * 0.5 - i * 0.4
-        if action == 2:
-            return r * 0.5 + i * 0.2
-        if action == 3:
-            return 0.2 if u < 0.5 else -0.3
-        return 0
+        return np.random.rand(4), {}
 
     def step(self, action):
-        next_state = self.state + np.random.normal(0, 0.05, size=6)
-        next_state = np.clip(next_state, -1, 1)
-        reward = self.estimate_reward(self.state, action)
-        self.state = next_state
-        return next_state, reward, False, {}
+        next_state = np.random.rand(4)
+        reward = np.random.randn() * 0.5 + (1 if action == 0 else -0.2)
+        done = False
+        return next_state, reward, done, {}
 
     def real_outcome(self, state, action):
-        s = np.asarray(state, dtype=np.float32).copy()
-        self.state = s.copy()
-        real_next_state, reward, _, _ = self.step(int(action))
-        real_reward = float(reward) + float(np.random.normal(0.0, 0.015))
-        return np.asarray(real_next_state, dtype=np.float32), float(real_reward)
+        next_state = np.random.rand(4)
+        reward = np.random.randn() * 0.5 + (1 if action == 0 else -0.2)
+        return next_state, reward
 
 
-# ============================================================
-# 2. WORLD MODEL
-# ============================================================
+# =========================
+# WORLD MODEL
+# =========================
+
+
 class WorldModel(nn.Module):
-    def __init__(self, state_dim=6, action_dim=4):
+    def __init__(self, state_dim):
         super().__init__()
-        self.action_dim = action_dim
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 64),
+        self.model = nn.Sequential(
+            nn.Linear(state_dim + 1, 32),
             nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, state_dim),
+            nn.Linear(32, state_dim),
         )
 
     def forward(self, state, action):
-        action_onehot = torch.nn.functional.one_hot(
-            action.long(), num_classes=self.action_dim
-        ).float()
-        x = torch.cat([state, action_onehot], dim=-1)
-        return self.net(x)
+        x = torch.cat([state, action], dim=1)
+        return self.model(x)
 
 
-# ============================================================
-# 3. MEMORY
-# ============================================================
+# =========================
+# FAISS MEMORY (STM)
+# =========================
+
+
 class VectorMemory:
-    def __init__(self, dim=6):
+    def __init__(self, dim):
         self.dim = dim
-        self.index = faiss.IndexFlatL2(6)
+        self.index = faiss.IndexFlatL2(dim)
         self.storage = []
 
     def add(self, state, action, next_state, reward):
-        state_vec = np.array(state, dtype=np.float32).reshape(1, self.dim)
-        self.index.add(state_vec)
+        vec = np.array(state, dtype=np.float32)
+        self.index.add(vec.reshape(1, -1))
         self.storage.append((state, action, next_state, reward))
 
-    def retrieve(self, query_state, k=3):
+    def retrieve(self, state, k=5):
         if len(self.storage) == 0:
             return []
-        query_vec = np.array(query_state, dtype=np.float32).reshape(1, self.dim)
-        top_k = min(k, len(self.storage))
-        _, indices = self.index.search(query_vec, top_k)
-        results = []
-        for idx in indices[0]:
-            if idx != -1:
-                results.append(self.storage[idx])
-        return results
+        vec = np.array(state, dtype=np.float32)
+        kk = min(k, len(self.storage))
+        _, I = self.index.search(vec.reshape(1, -1), kk)
+        return [self.storage[i] for i in I[0] if i != -1]
 
-    def retrieve_by_action(self, query_state, action, k=5):
-        memories = self.retrieve(query_state, k=max(k * 3, 10))
-        filtered = [m for m in memories if int(m[1]) == int(action)]
-        return filtered[:k]
+    def retrieve_by_action(self, state, action, k=5):
+        memories = self.retrieve(state, k=10)
+        return [m for m in memories if m[1] == action][:k]
 
 
-# ============================================================
-# 4. GOAL SYSTEM
-# ============================================================
-class GoalSystem:
+# =========================
+# STRATEGIC MEMORY (LTM)
+# =========================
+
+
+class StrategicMemory:
     def __init__(self):
-        self.weights = {
-            "client_satisfaction": 0.25,
-            "risk_reduction": 0.25,
-            "urgency_control": 0.25,
-            "confidence_growth": 0.25,
-        }
-        self.normalize_weights()
+        self.stats = {}
+        self.rules = []
 
-    def normalize_weights(self):
-        total = sum(self.weights.values())
-        for key in self.weights:
-            self.weights[key] = self.weights[key] / total
+    def update_stats(self, action, reward):
+        if action not in self.stats:
+            self.stats[action] = {"count": 0, "sum": 0}
+        self.stats[action]["count"] += 1
+        self.stats[action]["sum"] += reward
 
-    def evaluate_state_value(self, state):
-        vec = np.asarray(state, dtype=np.float64).reshape(-1)
-        u = float(vec[0])
-        sentiment = float(vec[1])
-        importance = float(vec[2])
-        risk = float(vec[3])
-        confidence = float(vec[5])
-        signals = {
-            "client_satisfaction": ((sentiment + 1) / 2) * importance,
-            "risk_reduction": 1 - risk,
-            "urgency_control": 1 - u,
-            "confidence_growth": confidence,
-        }
-        return float(sum(self.weights[k] * signals[k] for k in self.weights))
+    def maybe_create_rule(self, action):
+        stat = self.stats[action]
+        avg = stat["sum"] / stat["count"]
+        if stat["count"] < 5:
+            return None
+        if avg < -0.3:
+            return {
+                "action": action,
+                "rule": "avoid",
+                "confidence": min(1.0, abs(avg)),
+            }
+        if avg > 0.5:
+            return {
+                "action": action,
+                "rule": "prefer",
+                "confidence": min(1.0, avg),
+            }
+        return None
 
-    def update_weights(self, state, reward):
-        vec = np.asarray(state, dtype=np.float64).reshape(-1)
-        urgency = float(vec[0])
-        sentiment = float(vec[1])
-        importance = float(vec[2])
-        risk = float(vec[3])
-        confidence = float(vec[5])
+    def store(self, lesson):
+        for r in self.rules:
+            if r["action"] == lesson["action"] and r["rule"] == lesson["rule"]:
+                return
+        self.rules.append(lesson)
 
-        signals = {
-            "client_satisfaction": ((sentiment + 1) / 2) * importance,
-            "risk_reduction": 1 - risk,
-            "urgency_control": 1 - urgency,
-            "confidence_growth": confidence,
-        }
-
-        learning_rate = 0.03
-
-        for key, signal in signals.items():
-            if reward > 0:
-                self.weights[key] += learning_rate * signal
-            else:
-                self.weights[key] -= learning_rate * signal
-
-            self.weights[key] = max(0.05, min(0.70, self.weights[key]))
-
-        self.normalize_weights()
+    def match(self, state):
+        return self.rules
 
 
-# ============================================================
-# 5. ORCHESTRATOR
-# ============================================================
+# =========================
+# AGENT
+# =========================
+
+
 class Agent:
     def __init__(self):
         self.env = EmailEnv()
-        self.model = WorldModel()
-        self.memory = VectorMemory(dim=6)
-        self.goal_system = GoalSystem()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        self.loss_fn = nn.MSELoss()
-        self.epsilon = 0.25
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.97
-        self.exploration_count = 0
-        self.exploitation_count = 0
+        self.memory = VectorMemory(dim=4)
+        self.long_memory = StrategicMemory()
+        self.world_model = WorldModel(4)
+        self.optimizer = optim.Adam(self.world_model.parameters(), lr=0.01)
+        self.criterion = nn.MSELoss()
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.95
+        self.epsilon_min = 0.1
 
-    def collect(self):
-        state, _ = self.env.reset()
-        for _ in range(50):
-            action = random.randint(0, 3)
-            next_state, reward, _, _ = self.env.step(action)
-            self.memory.add(state, action, next_state, reward)
-            state = next_state
+    def estimate_uncertainty(self, state, action):
+        memories = self.memory.retrieve_by_action(state, action)
+        if len(memories) < 2:
+            return 1.0
+        rewards = [m[3] for m in memories]
+        return float(np.std(rewards))
 
-    def train(self):
-        if len(self.memory.storage) < 32:
-            return
-        batch = random.sample(self.memory.storage, 32)
-        states = torch.tensor(
-            np.array([b[0] for b in batch]), dtype=torch.float32
-        )
-        actions = torch.tensor(
-            np.array([b[1] for b in batch]), dtype=torch.int64
-        )
-        next_states = torch.tensor(
-            np.array([b[2] for b in batch]), dtype=torch.float32
-        )
-        pred = self.model(states, actions)
-        loss = self.loss_fn(pred, next_states)
+    def rollout(self, state, action, horizon=3):
+        total_score = 0
+        current_state = np.asarray(state, dtype=np.float32).copy()
+        for _ in range(horizon):
+            state_t = torch.tensor(current_state, dtype=torch.float32).unsqueeze(
+                0
+            )
+            action_t = torch.tensor([[action]], dtype=torch.float32)
+            with torch.no_grad():
+                next_state = self.world_model(state_t, action_t).numpy()[0]
+            memories = self.memory.retrieve(next_state)
+            memory_reward = (
+                np.mean([m[3] for m in memories]) if memories else 0
+            )
+            rules = self.long_memory.match(state)
+            penalty = 0
+            for r in rules:
+                if r["action"] == action and r["rule"] == "avoid":
+                    penalty -= r["confidence"]
+                if r["action"] == action and r["rule"] == "prefer":
+                    penalty += r["confidence"]
+            score = memory_reward + penalty
+            total_score += score
+            current_state = next_state.astype(np.float32)
+        return total_score, current_state
+
+    def select_action(self, state):
+        explore = random.random() < self.epsilon
+        scores = []
+        for action in range(self.env.action_dim):
+            uncertainty = self.estimate_uncertainty(state, action)
+            rollout_score, final_state = self.rollout(state, action)
+            rollout_norm = np.tanh(rollout_score)
+            score = uncertainty + 0.15 * rollout_norm
+            scores.append(
+                (
+                    action,
+                    score,
+                    rollout_score,
+                    uncertainty,
+                    final_state,
+                )
+            )
+        scores.sort(key=lambda x: x[1], reverse=True)
+        if explore:
+            chosen = scores[0]
+            mode = "exploration intelligente"
+        else:
+            chosen = max(scores, key=lambda x: x[2])
+            mode = "exploitation"
+        return chosen, mode
+
+    def train_model(self, state, action, next_state):
+        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        action_t = torch.tensor([[action]], dtype=torch.float32)
+        next_t = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)
+        pred = self.world_model(state_t, action_t)
+        loss = self.criterion(pred, next_t)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         return loss.item()
 
-    def rollout(self, state, first_action, horizon=3):
-        current_state = np.asarray(state, dtype=np.float32).copy()
-        total_score = 0.0
-        discount = 1.0
-        gamma = 0.85
-        trajectory = []
-
-        with torch.no_grad():
-            for step in range(horizon):
-                if step == 0:
-                    action = first_action
-                else:
-                    action = max(
-                        range(4),
-                        key=lambda a: self.env.estimate_reward(current_state, a),
-                    )
-
-                state_t = torch.tensor(
-                    current_state, dtype=torch.float32
-                ).unsqueeze(0)
-                action_t = torch.tensor([action], dtype=torch.int64)
-                pred = self.model(state_t, action_t)
-                next_state = np.asarray(
-                    pred.squeeze(0).cpu().numpy(), dtype=np.float32
-                )
-
-                goal_value = self.goal_system.evaluate_state_value(next_state)
-
-                similar = self.memory.retrieve(next_state, k=3)
-                if similar:
-                    memory_reward = float(
-                        np.mean([float(m[3]) for m in similar])
-                    )
-                else:
-                    memory_reward = 0.0
-
-                immediate_reward = float(
-                    self.env.estimate_reward(current_state, action)
-                )
-                risk_penalty = float(next_state[3]) * 0.3
-                urgency_penalty = float(next_state[0]) * 0.2
-                step_score = (
-                    immediate_reward
-                    + 0.4 * memory_reward
-                    + 0.6 * goal_value
-                    - risk_penalty
-                    - urgency_penalty
-                )
-
-                total_score += discount * step_score
-                discount *= gamma
-
-                trajectory.append(
-                    {
-                        "action_name": self.env.ACTIONS[action],
-                        "immediate_reward": immediate_reward,
-                        "memory_reward": memory_reward,
-                        "goal_value": goal_value,
-                        "risk_penalty": risk_penalty,
-                        "urgency_penalty": urgency_penalty,
-                        "step_score": step_score,
-                        "next_state": next_state,
-                    }
-                )
-                current_state = next_state
-
-        return {
-            "first_action": first_action,
-            "first_action_name": self.env.ACTIONS[first_action],
-            "total_score": total_score,
-            "trajectory": trajectory,
-        }
-
-    def rollout_all_actions(self, state, horizon=3):
-        rollouts = [self.rollout(state, a, horizon) for a in range(4)]
-        rollouts.sort(key=lambda r: r["total_score"], reverse=True)
-        return rollouts
-
-    def _print_rollout_simulation(self, rollouts):
-        print("Rollout simulation:")
-        for r in sorted(rollouts, key=lambda x: x["first_action"]):
-            print(
-                f"- {r['first_action_name']} | total={r['total_score']:.2f}"
-            )
-            for si, step in enumerate(r["trajectory"]):
-                print(
-                    f"  step {si} -> action={step['action_name']} | "
-                    f"immediate={step['immediate_reward']:.2f} | "
-                    f"memory={step['memory_reward']:.2f} | "
-                    f"goal={step['goal_value']:.2f} | "
-                    f"score={step['step_score']:.2f}"
-                )
-
-    def decide(self, state):
-        rollouts = self.rollout_all_actions(state, horizon=3)
-        self._print_rollout_simulation(rollouts)
-        best = max(rollouts, key=lambda r: r["total_score"])
-        final_predicted_state = best["trajectory"][-1]["next_state"]
-        return (
-            best["first_action"],
-            best["total_score"],
-            final_predicted_state,
-            best,
-        )
-
-    def estimate_action_uncertainty(self, state, action):
-        memories = self.memory.retrieve_by_action(state, action, k=5)
-        if len(memories) < 2:
-            return 1.0
-        rewards = np.array([m[3] for m in memories], dtype=np.float32)
-        uncertainty = float(np.std(rewards))
-        return uncertainty
-
-    def choose_exploration_action(self, state):
-        scores = []
-        for action in range(self.env.action_dim):
-            uncertainty = self.estimate_action_uncertainty(state, action)
-            rollout_info = self.rollout(state, action, horizon=3)
-            score = uncertainty + 0.15 * rollout_info["total_score"]
-            scores.append(
-                {
-                    "action": action,
-                    "action_name": self.env.ACTIONS[action],
-                    "uncertainty": uncertainty,
-                    "rollout_score": rollout_info["total_score"],
-                    "exploration_score": score,
-                    "rollout_info": rollout_info,
-                }
-            )
-        scores.sort(key=lambda x: x["exploration_score"], reverse=True)
-        return scores[0], scores
-
-    def select_action(self, state):
-        explore = random.random() < self.epsilon
-        mode = "exploration" if explore else "exploitation"
-        print(f"Selection mode: {mode}")
-
-        if explore:
-            best, exploration_scores = self.choose_exploration_action(state)
-            print("Intelligent exploration:")
-            for row in sorted(exploration_scores, key=lambda x: x["action"]):
-                print(
-                    f"- {row['action_name']} | "
-                    f"uncertainty={row['uncertainty']:.2f} | "
-                    f"rollout={row['rollout_score']:.2f} | "
-                    f"exploration_score={row['exploration_score']:.2f}"
-                )
-            rollout_info = best["rollout_info"]
-            action = best["action"]
-            trajectory_score = rollout_info["total_score"]
-            final_predicted_state = rollout_info["trajectory"][-1][
-                "next_state"
-            ]
-            self.exploration_count += 1
-        else:
-            action, trajectory_score, final_predicted_state, rollout_info = (
-                self.decide(state)
-            )
-            self.exploitation_count += 1
-
-        self.epsilon = max(
-            self.epsilon_min, self.epsilon * self.epsilon_decay
-        )
-        return (
-            action,
-            trajectory_score,
-            final_predicted_state,
-            rollout_info,
-            mode,
-        )
-
-    def apply_reality_feedback(
-        self, state, action, predicted_next_state, predicted_score
-    ):
-        real_next_state, real_reward = self.env.real_outcome(state, action)
-
-        prediction_error = float(
-            np.mean(
-                np.abs(
-                    np.asarray(real_next_state, dtype=np.float32)
-                    - np.asarray(predicted_next_state, dtype=np.float32)
-                )
-            )
-        )
-        corrected_score = float(real_reward) - prediction_error
-
-        self.goal_system.update_weights(real_next_state, corrected_score)
-        self.memory.add(state, action, real_next_state, real_reward)
-
-        return {
-            "real_next_state": real_next_state,
-            "real_reward": real_reward,
-            "prediction_error": prediction_error,
-            "corrected_score": corrected_score,
-        }
+    def apply_feedback(self, state, action):
+        next_state, reward = self.env.real_outcome(state, action)
+        self.memory.add(state, action, next_state, reward)
+        self.long_memory.update_stats(action, reward)
+        lesson = self.long_memory.maybe_create_rule(action)
+        if lesson:
+            self.long_memory.store(lesson)
+        return next_state, reward
 
 
-# ============================================================
-# 6. MAIN
-# ============================================================
+# =========================
+# MAIN LOOP
+# =========================
+
+
 if __name__ == "__main__":
     agent = Agent()
+    errors = []
     for epoch in range(30):
-        agent.collect()
-        loss = agent.train()
         state, _ = agent.env.reset()
-        print(f"Epoch {epoch}")
-        print(f"State: {np.round(state, 2)}")
-        (
-            action,
-            trajectory_score,
-            final_predicted_state,
-            rollout_info,
-            mode,
-        ) = agent.select_action(state)
-        feedback = agent.apply_reality_feedback(
-            state,
-            action,
-            final_predicted_state,
-            trajectory_score,
+        action_info, mode = agent.select_action(state)
+        action, _, rollout_score, uncertainty, _ = action_info
+        next_state, reward = agent.apply_feedback(state, action)
+        _ = agent.train_model(state, action, next_state)
+        reward_f = float(reward)
+        rollout_score_f = float(rollout_score)
+        error = abs(rollout_score_f - reward_f)
+        errors.append(error)
+        if len(errors) > 50:
+            errors.pop(0)
+        avg_error = sum(errors) / len(errors)
+        agent.epsilon = max(
+            agent.epsilon * agent.epsilon_decay, agent.epsilon_min
         )
-        print(f"Decision: {agent.env.ACTIONS[action]}")
-        print(f"Trajectory score: {trajectory_score:.2f}")
         print(
-            f"Predicted next/final state: {np.round(final_predicted_state, 2)}"
+            {
+                "epoch": epoch,
+                "mode": mode,
+                "action": agent.env.ACTIONS[action],
+                "uncertainty": round(float(uncertainty), 3),
+                "rollout_score": round(rollout_score_f, 3),
+                "real_reward": round(reward_f, 3),
+                "prediction_error": round(error, 3),
+                "avg_prediction_error": round(avg_error, 3),
+                "memory_size": len(agent.memory.storage),
+                "rules_count": len(agent.long_memory.rules),
+            }
         )
-        print("Reality feedback:")
-        print(f"- real_reward: {feedback['real_reward']:.2f}")
-        print(f"- prediction_error: {feedback['prediction_error']:.2f}")
-        print(f"- corrected_score: {feedback['corrected_score']:.2f}")
-        print(
-            f"- real_next_state: {np.round(feedback['real_next_state'], 2)}"
-        )
-        print("Adaptive weights:")
-        for wkey in (
-            "client_satisfaction",
-            "risk_reduction",
-            "urgency_control",
-            "confidence_growth",
-        ):
-            print(f"- {wkey}: {agent.goal_system.weights[wkey]:.3f}")
-        print(f"Epsilon: {agent.epsilon:.3f}")
-        print(f"Exploration count: {agent.exploration_count}")
-        print(f"Exploitation count: {agent.exploitation_count}")
-        print(f"Loss: {loss}")
-        print(f"Memory size: {len(agent.memory.storage)}")
