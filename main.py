@@ -190,6 +190,11 @@ class Agent:
         self.goal_system = GoalSystem()
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.loss_fn = nn.MSELoss()
+        self.epsilon = 0.25
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.97
+        self.exploration_count = 0
+        self.exploitation_count = 0
 
     def collect(self):
         state, _ = self.env.reset()
@@ -297,8 +302,7 @@ class Agent:
         rollouts.sort(key=lambda r: r["total_score"], reverse=True)
         return rollouts
 
-    def decide(self, state):
-        rollouts = self.rollout_all_actions(state, horizon=3)
+    def _print_rollout_simulation(self, rollouts):
         print("Rollout simulation:")
         for r in sorted(rollouts, key=lambda x: x["first_action"]):
             print(
@@ -312,6 +316,10 @@ class Agent:
                     f"goal={step['goal_value']:.2f} | "
                     f"score={step['step_score']:.2f}"
                 )
+
+    def decide(self, state):
+        rollouts = self.rollout_all_actions(state, horizon=3)
+        self._print_rollout_simulation(rollouts)
         best = max(rollouts, key=lambda r: r["total_score"])
         final_predicted_state = best["trajectory"][-1]["next_state"]
         return (
@@ -319,6 +327,37 @@ class Agent:
             best["total_score"],
             final_predicted_state,
             best,
+        )
+
+    def select_action(self, state):
+        explore = random.random() < self.epsilon
+        mode = "exploration" if explore else "exploitation"
+        print(f"Selection mode: {mode}")
+
+        if explore:
+            action = random.randint(0, 3)
+            rollout_info = self.rollout(state, action, horizon=3)
+            self._print_rollout_simulation([rollout_info])
+            trajectory_score = rollout_info["total_score"]
+            final_predicted_state = rollout_info["trajectory"][-1][
+                "next_state"
+            ]
+            self.exploration_count += 1
+        else:
+            action, trajectory_score, final_predicted_state, rollout_info = (
+                self.decide(state)
+            )
+            self.exploitation_count += 1
+
+        self.epsilon = max(
+            self.epsilon_min, self.epsilon * self.epsilon_decay
+        )
+        return (
+            action,
+            trajectory_score,
+            final_predicted_state,
+            rollout_info,
+            mode,
         )
 
     def apply_reality_feedback(
@@ -358,15 +397,21 @@ if __name__ == "__main__":
         state, _ = agent.env.reset()
         print(f"Epoch {epoch}")
         print(f"State: {np.round(state, 2)}")
-        action, total_score, final_predicted_state, _ = agent.decide(state)
+        (
+            action,
+            trajectory_score,
+            final_predicted_state,
+            rollout_info,
+            mode,
+        ) = agent.select_action(state)
         feedback = agent.apply_reality_feedback(
             state,
             action,
             final_predicted_state,
-            total_score,
+            trajectory_score,
         )
         print(f"Decision: {agent.env.ACTIONS[action]}")
-        print(f"Trajectory score: {total_score:.2f}")
+        print(f"Trajectory score: {trajectory_score:.2f}")
         print(
             f"Predicted next/final state: {np.round(final_predicted_state, 2)}"
         )
@@ -385,5 +430,8 @@ if __name__ == "__main__":
             "confidence_growth",
         ):
             print(f"- {wkey}: {agent.goal_system.weights[wkey]:.3f}")
+        print(f"Epsilon: {agent.epsilon:.3f}")
+        print(f"Exploration count: {agent.exploration_count}")
+        print(f"Exploitation count: {agent.exploitation_count}")
         print(f"Loss: {loss}")
         print(f"Memory size: {len(agent.memory.storage)}")
