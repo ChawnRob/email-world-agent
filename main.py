@@ -117,6 +117,11 @@ class VectorMemory:
                 results.append(self.storage[idx])
         return results
 
+    def retrieve_by_action(self, query_state, action, k=5):
+        memories = self.retrieve(query_state, k=max(k * 3, 10))
+        filtered = [m for m in memories if int(m[1]) == int(action)]
+        return filtered[:k]
+
 
 # ============================================================
 # 4. GOAL SYSTEM
@@ -329,15 +334,50 @@ class Agent:
             best,
         )
 
+    def estimate_action_uncertainty(self, state, action):
+        memories = self.memory.retrieve_by_action(state, action, k=5)
+        if len(memories) < 2:
+            return 1.0
+        rewards = np.array([m[3] for m in memories], dtype=np.float32)
+        uncertainty = float(np.std(rewards))
+        return uncertainty
+
+    def choose_exploration_action(self, state):
+        scores = []
+        for action in range(self.env.action_dim):
+            uncertainty = self.estimate_action_uncertainty(state, action)
+            rollout_info = self.rollout(state, action, horizon=3)
+            score = uncertainty + 0.15 * rollout_info["total_score"]
+            scores.append(
+                {
+                    "action": action,
+                    "action_name": self.env.ACTIONS[action],
+                    "uncertainty": uncertainty,
+                    "rollout_score": rollout_info["total_score"],
+                    "exploration_score": score,
+                    "rollout_info": rollout_info,
+                }
+            )
+        scores.sort(key=lambda x: x["exploration_score"], reverse=True)
+        return scores[0], scores
+
     def select_action(self, state):
         explore = random.random() < self.epsilon
         mode = "exploration" if explore else "exploitation"
         print(f"Selection mode: {mode}")
 
         if explore:
-            action = random.randint(0, 3)
-            rollout_info = self.rollout(state, action, horizon=3)
-            self._print_rollout_simulation([rollout_info])
+            best, exploration_scores = self.choose_exploration_action(state)
+            print("Intelligent exploration:")
+            for row in sorted(exploration_scores, key=lambda x: x["action"]):
+                print(
+                    f"- {row['action_name']} | "
+                    f"uncertainty={row['uncertainty']:.2f} | "
+                    f"rollout={row['rollout_score']:.2f} | "
+                    f"exploration_score={row['exploration_score']:.2f}"
+                )
+            rollout_info = best["rollout_info"]
+            action = best["action"]
             trajectory_score = rollout_info["total_score"]
             final_predicted_state = rollout_info["trajectory"][-1][
                 "next_state"
