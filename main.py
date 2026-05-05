@@ -222,30 +222,90 @@ class Agent:
             current_state = next_state.astype(np.float32)
         return total_score, current_state
 
+    def optimistic_score(self, state, action):
+        rollout_score, _ = self.rollout(state, action)
+        return float(rollout_score)
+
+    def cautious_score(self, state, action):
+        uncertainty = self.estimate_uncertainty(state, action)
+        return float(-uncertainty)
+
+    def explorer_score(self, state, action):
+        return float(self.estimate_uncertainty(state, action))
+
+    def critic_score(self, state, action):
+        rollout_score, _ = self.rollout(state, action)
+        uncertainty = self.estimate_uncertainty(state, action)
+        return float(rollout_score - uncertainty)
+
+    def debate(self, state):
+        results = []
+        for action in range(self.env.action_dim):
+            opt = self.optimistic_score(state, action)
+            cau = self.cautious_score(state, action)
+            exp = self.explorer_score(state, action)
+            cri = self.critic_score(state, action)
+            final = (
+                0.4 * opt
+                + 0.2 * cau
+                + 0.2 * exp
+                + 0.2 * cri
+            )
+            results.append(
+                {
+                    "action": action,
+                    "scores": {
+                        "optimist": opt,
+                        "cautious": cau,
+                        "explorer": exp,
+                        "critic": cri,
+                    },
+                    "final": final,
+                }
+            )
+        results.sort(key=lambda x: x["final"], reverse=True)
+        return results
+
     def select_action(self, state):
         explore = random.random() < self.epsilon
-        scores = []
-        for action in range(self.env.action_dim):
-            uncertainty = self.estimate_uncertainty(state, action)
-            rollout_score, final_state = self.rollout(state, action)
-            rollout_norm = np.tanh(rollout_score)
-            score = uncertainty + 0.15 * rollout_norm
-            scores.append(
-                (
-                    action,
-                    score,
-                    rollout_score,
-                    uncertainty,
-                    final_state,
-                )
-            )
-        scores.sort(key=lambda x: x[1], reverse=True)
         if explore:
+            scores = []
+            for action in range(self.env.action_dim):
+                uncertainty = self.estimate_uncertainty(state, action)
+                rollout_score, final_state = self.rollout(state, action)
+                rollout_norm = np.tanh(rollout_score)
+                score = uncertainty + 0.15 * rollout_norm
+                scores.append(
+                    (
+                        action,
+                        score,
+                        rollout_score,
+                        uncertainty,
+                        final_state,
+                    )
+                )
+            scores.sort(key=lambda x: x[1], reverse=True)
             chosen = scores[0]
             mode = "exploration intelligente"
         else:
-            chosen = max(scores, key=lambda x: x[2])
-            mode = "exploitation"
+            debate_results = self.debate(state)
+            print("\n--- DEBATE ---")
+            for r in debate_results:
+                print(
+                    f"Action {r['action']} → final={round(r['final'], 2)} | "
+                    f"{r['scores']}"
+                )
+            best = debate_results[0]
+            action = best["action"]
+            rollout_score, final_state = self.rollout(state, action)
+            chosen = (
+                action,
+                best["final"],
+                rollout_score,
+                0,
+                final_state,
+            )
+            mode = "debate"
         return chosen, mode
 
     def train_model(self, state, action, next_state):
