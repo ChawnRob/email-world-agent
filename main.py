@@ -60,6 +60,13 @@ class EmailEnv:
         self.state = next_state
         return next_state, reward, False, {}
 
+    def real_outcome(self, state, action):
+        s = np.asarray(state, dtype=np.float32).copy()
+        self.state = s.copy()
+        real_next_state, reward, _, _ = self.step(int(action))
+        real_reward = float(reward) + float(np.random.normal(0.0, 0.015))
+        return np.asarray(real_next_state, dtype=np.float32), float(real_reward)
+
 
 # ============================================================
 # 2. WORLD MODEL
@@ -314,8 +321,30 @@ class Agent:
             best,
         )
 
-    def learn_from_outcome(self, final_state, total_score):
-        self.goal_system.update_weights(final_state, total_score)
+    def apply_reality_feedback(
+        self, state, action, predicted_next_state, predicted_score
+    ):
+        real_next_state, real_reward = self.env.real_outcome(state, action)
+
+        prediction_error = float(
+            np.mean(
+                np.abs(
+                    np.asarray(real_next_state, dtype=np.float32)
+                    - np.asarray(predicted_next_state, dtype=np.float32)
+                )
+            )
+        )
+        corrected_score = float(real_reward) - prediction_error
+
+        self.goal_system.update_weights(real_next_state, corrected_score)
+        self.memory.add(state, action, real_next_state, real_reward)
+
+        return {
+            "real_next_state": real_next_state,
+            "real_reward": real_reward,
+            "prediction_error": prediction_error,
+            "corrected_score": corrected_score,
+        }
 
 
 # ============================================================
@@ -330,14 +359,24 @@ if __name__ == "__main__":
         print(f"Epoch {epoch}")
         print(f"State: {np.round(state, 2)}")
         action, total_score, final_predicted_state, _ = agent.decide(state)
-        final_goal_value = agent.goal_system.evaluate_state_value(
-            final_predicted_state
+        feedback = agent.apply_reality_feedback(
+            state,
+            action,
+            final_predicted_state,
+            total_score,
         )
         print(f"Decision: {agent.env.ACTIONS[action]}")
         print(f"Trajectory score: {total_score:.2f}")
-        print(f"Final goal value: {final_goal_value:.2f}")
-        print(f"Final predicted state: {np.round(final_predicted_state, 2)}")
-        agent.learn_from_outcome(final_predicted_state, total_score)
+        print(
+            f"Predicted next/final state: {np.round(final_predicted_state, 2)}"
+        )
+        print("Reality feedback:")
+        print(f"- real_reward: {feedback['real_reward']:.2f}")
+        print(f"- prediction_error: {feedback['prediction_error']:.2f}")
+        print(f"- corrected_score: {feedback['corrected_score']:.2f}")
+        print(
+            f"- real_next_state: {np.round(feedback['real_next_state'], 2)}"
+        )
         print("Adaptive weights:")
         for wkey in (
             "client_satisfaction",
