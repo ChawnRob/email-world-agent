@@ -182,6 +182,25 @@ class Agent:
         self.epsilon = 1.0
         self.epsilon_decay = 0.95
         self.epsilon_min = 0.1
+        self.agent_stats = {
+            "optimist": {"weight": 1.0, "score": 0.0},
+            "cautious": {"weight": 1.0, "score": 0.0},
+            "explorer": {"weight": 1.0, "score": 0.0},
+            "critic": {"weight": 1.0, "score": 0.0},
+        }
+        self.normalize_weights()
+
+    def normalize_weights(self):
+        keys = list(self.agent_stats.keys())
+        temperature = 0.5  # <1 = plus agressif
+        weights = np.array(
+            [self.agent_stats[k]["weight"] for k in keys], dtype=np.float64
+        )
+        weights = weights - np.max(weights)
+        exp_w = np.exp(weights / temperature)
+        softmax = exp_w / np.sum(exp_w)
+        for i, key in enumerate(keys):
+            self.agent_stats[key]["norm_weight"] = float(softmax[i])
 
     def estimate_uncertainty(self, state, action):
         memories = self.memory.retrieve_by_action(state, action)
@@ -238,6 +257,28 @@ class Agent:
         uncertainty = self.estimate_uncertainty(state, action)
         return float(rollout_score - uncertainty)
 
+    def detect_conflict(self, scores):
+        values = list(scores.values())
+        variance = np.var(values)
+        return variance > 0.1, float(variance)
+
+    def get_conflict_pair(self, scores):
+        sorted_agents = sorted(scores.items(), key=lambda x: x[1])
+        worst = sorted_agents[0]
+        best = sorted_agents[-1]
+        return best, worst
+
+    def build_conflict_message(self, best, worst):
+        best_name, best_score = best
+        worst_name, worst_score = worst
+        return (
+            "\n"
+            "⚠️ CONFLICT DETECTED\n"
+            f"{best_name.upper()} → {best_score:.3f} : favorable\n"
+            f"{worst_name.upper()} → {worst_score:.3f} : opposé\n"
+            f"Δ divergence = {abs(best_score - worst_score):.3f}\n"
+        )
+
     def debate(self, state):
         results = []
         for action in range(self.env.action_dim):
@@ -245,26 +286,48 @@ class Agent:
             cau = self.cautious_score(state, action)
             exp = self.explorer_score(state, action)
             cri = self.critic_score(state, action)
+            scores = {
+                "optimist": opt,
+                "cautious": cau,
+                "explorer": exp,
+                "critic": cri,
+            }
+            conflict, variance = self.detect_conflict(scores)
+            if conflict:
+                best, worst = self.get_conflict_pair(scores)
+                msg = self.build_conflict_message(best, worst)
+                print(msg)
+            self.normalize_weights()
             final = (
-                0.4 * opt
-                + 0.2 * cau
-                + 0.2 * exp
-                + 0.2 * cri
+                self.agent_stats["optimist"]["norm_weight"] * opt
+                + self.agent_stats["cautious"]["norm_weight"] * cau
+                + self.agent_stats["explorer"]["norm_weight"] * exp
+                + self.agent_stats["critic"]["norm_weight"] * cri
             )
+            if conflict:
+                penalty = variance * 0.3
+                final -= penalty
             results.append(
                 {
                     "action": action,
-                    "scores": {
-                        "optimist": opt,
-                        "cautious": cau,
-                        "explorer": exp,
-                        "critic": cri,
-                    },
+                    "scores": scores,
                     "final": final,
                 }
             )
         results.sort(key=lambda x: x["final"], reverse=True)
         return results
+
+    def update_agent_confidence(self, predicted_scores, real_reward):
+        for name, predicted in predicted_scores.items():
+            error = abs(float(predicted) - float(real_reward))
+            performance = 1.0 / (1.0 + error)
+            self.agent_stats[name]["score"] = (
+                0.9 * self.agent_stats[name]["score"] + 0.1 * performance
+            )
+            self.agent_stats[name]["weight"] = max(
+                self.agent_stats[name]["score"], 0.05
+            )
+        self.normalize_weights()
 
     def select_action(self, state):
         explore = random.random() < self.epsilon
@@ -287,6 +350,14 @@ class Agent:
             scores.sort(key=lambda x: x[1], reverse=True)
             chosen = scores[0]
             mode = "exploration intelligente"
+            action = chosen[0]
+            predicted_scores = {
+                "optimist": self.optimistic_score(state, action),
+                "cautious": self.cautious_score(state, action),
+                "explorer": self.explorer_score(state, action),
+                "critic": self.critic_score(state, action),
+            }
+            chosen = (*chosen, predicted_scores)
         else:
             debate_results = self.debate(state)
             print("\n--- DEBATE ---")
@@ -298,12 +369,14 @@ class Agent:
             best = debate_results[0]
             action = best["action"]
             rollout_score, final_state = self.rollout(state, action)
+            predicted_scores = best["scores"]
             chosen = (
                 action,
                 best["final"],
                 rollout_score,
                 0,
                 final_state,
+                predicted_scores,
             )
             mode = "debate"
         return chosen, mode
@@ -319,13 +392,14 @@ class Agent:
         self.optimizer.step()
         return loss.item()
 
-    def apply_feedback(self, state, action):
+    def apply_feedback(self, state, action, predicted_scores):
         next_state, reward = self.env.real_outcome(state, action)
         self.memory.add(state, action, next_state, reward)
         self.long_memory.update_stats(action, reward)
         lesson = self.long_memory.maybe_create_rule(action, state)
         if lesson:
             self.long_memory.store(lesson)
+        self.update_agent_confidence(predicted_scores, reward)
         return next_state, reward
 
 
@@ -340,8 +414,10 @@ if __name__ == "__main__":
     for epoch in range(30):
         state, _ = agent.env.reset()
         action_info, mode = agent.select_action(state)
-        action, _, rollout_score, uncertainty, _ = action_info
-        next_state, reward = agent.apply_feedback(state, action)
+        action, _, rollout_score, uncertainty, _, predicted_scores = action_info
+        next_state, reward = agent.apply_feedback(
+            state, action, predicted_scores
+        )
         _ = agent.train_model(state, action, next_state)
         reward_f = float(reward)
         rollout_score_f = float(rollout_score)
@@ -367,3 +443,8 @@ if __name__ == "__main__":
                 "rules_count": len(agent.long_memory.rules),
             }
         )
+        print("\n=== AGENT WEIGHTS ===")
+        for k, v in agent.agent_stats.items():
+            print(
+                f"{k}: weight={v['norm_weight']:.3f} score={v['score']:.3f}"
+            )
