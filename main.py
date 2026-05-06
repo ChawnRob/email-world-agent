@@ -516,54 +516,57 @@ class Agent:
 
 
 if __name__ == "__main__":
-    agent = Agent()
-    errors = []
-    for epoch in range(30):
-        state, _ = agent.env.reset()
-        action_info, mode = agent.select_action(state)
-        (
-            action,
-            _,
-            rollout_score,
-            uncertainty,
-            _,
-            predicted_scores,
-            chosen_strategy,
-        ) = action_info
-        next_state, reward = agent.apply_feedback(
-            state, action, predicted_scores, chosen_strategy
-        )
-        _ = agent.train_model(state, action, next_state)
-        reward_f = float(reward)
-        rollout_score_f = float(rollout_score)
-        error = abs(rollout_score_f - reward_f)
-        errors.append(error)
-        if len(errors) > 50:
-            errors.pop(0)
-        avg_error = sum(errors) / len(errors)
-        agent.epsilon = max(
-            agent.epsilon * agent.epsilon_decay, agent.epsilon_min
-        )
-        print(
-            {
-                "epoch": epoch,
-                "mode": mode,
-                "action": agent.env.ACTIONS[action],
-                "uncertainty": round(float(uncertainty), 3),
-                "rollout_score": round(rollout_score_f, 3),
-                "real_reward": round(reward_f, 3),
-                "prediction_error": round(error, 3),
-                "avg_prediction_error": round(avg_error, 3),
-                "memory_size": len(agent.memory.storage),
-                "rules_count": len(agent.long_memory.rules),
-            }
-        )
-        print("\n=== AGENT WEIGHTS ===")
-        for k, v in agent.agent_stats.items():
-            print(
-                f"{k}: weight={v['norm_weight']:.3f} score={v['score']:.3f}"
+    try:
+        agent = Agent()
+        errors = []
+        for epoch in range(30):
+            state, _ = agent.env.reset()
+            action_info, mode = agent.select_action(state)
+            (
+                action,
+                _,
+                rollout_score,
+                uncertainty,
+                _,
+                predicted_scores,
+                chosen_strategy,
+            ) = action_info
+            next_state, reward = agent.apply_feedback(
+                state, action, predicted_scores, chosen_strategy
             )
-        print("=== STRATEGY STATS ===")
-        for k, v in agent.strategy_stats.items():
-            avg = v["score"] / v["count"]
-            print(f"{k}: avg={avg:.3f}, count={v['count']}")
+            _ = agent.train_model(state, action, next_state)
+            reward_f = float(reward)
+            rollout_score_f = float(rollout_score)
+            error = abs(rollout_score_f - reward_f)
+            errors.append(error)
+            if len(errors) > 50:
+                errors.pop(0)
+            avg_error = sum(errors) / len(errors)
+            agent.epsilon = max(
+                agent.epsilon * agent.epsilon_decay, agent.epsilon_min
+            )
+            print(
+                {
+                    "epoch": epoch,
+                    "mode": mode,
+                    "action": agent.env.ACTIONS[action],
+                    "uncertainty": round(float(uncertainty), 3),
+                    "rollout_score": round(rollout_score_f, 3),
+                    "real_reward": round(reward_f, 3),
+                    "prediction_error": round(error, 3),
+                    "avg_prediction_error": round(avg_error, 3),
+                    "memory_size": len(agent.memory.storage),
+                    "rules_count": len(agent.long_memory.rules),
+                }
+            )
+            print("\n=== AGENT WEIGHTS ===")
+            for k, v in agent.agent_stats.items():
+                print(
+                    f"{k}: weight={v['norm_weight']:.3f} score={v['score']:.3f}"
+                )
+            print("=== STRATEGY STATS ===")
+            for k, v in agent.strategy_stats.items():
+                avg = v["score"] / v["count"]
+                print(f"{k}: avg={avg:.3f}, count={v['count']}")
+    except Exception as e:
+        print("FATAL ERROR:", e)
