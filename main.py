@@ -231,12 +231,6 @@ class Agent:
                 np.mean([m[3] for m in memories]) if memories else 0
             )
             rules = self.long_memory.match(current_state)
-            for r in rules:
-                print(
-                    f"Rule → action {r['action']} | {r['rule']} | "
-                    f"conf={round(r['confidence'], 2)} | "
-                    f"sim={round(r['similarity'], 2)}"
-                )
             penalty = 0
             for r in rules:
                 if r["rule"] == "avoid":
@@ -350,7 +344,7 @@ class Agent:
             best_agent = max(weights.items(), key=lambda x: x[1])[0]
             final = scores[best_agent]
         else:
-            deep_score, _ = self.rollout(state, action, horizon=5)
+            deep_score, _ = self.rollout(state, action, horizon=2)
             final = 0.7 * max(scores.values()) + 0.3 * deep_score
         return float(final), strategy, variance, strat_scores
 
@@ -459,10 +453,10 @@ class Agent:
             mode = "exploration intelligente"
             action = chosen[0]
             predicted_scores = {
-                "optimist": self.optimistic_score(state, action),
+                "optimist": chosen[2],
                 "cautious": self.cautious_score(state, action),
                 "explorer": self.explorer_score(state, action),
-                "critic": self.critic_score(state, action),
+                "critic": chosen[2] - self.estimate_uncertainty(state, action),
             }
             chosen = (*chosen, predicted_scores, "exploration")
         else:
@@ -475,7 +469,8 @@ class Agent:
                 )
             best = debate_results[0]
             action = best["action"]
-            rollout_score, final_state = self.rollout(state, action)
+            rollout_score = best["final"]
+            final_state = np.asarray(state, dtype=np.float32)
             predicted_scores = best["scores"]
             chosen_strategy = best.get("strategy", "none")
             chosen = (
