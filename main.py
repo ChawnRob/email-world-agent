@@ -281,7 +281,14 @@ class Agent:
         )
 
     def build_explanation(
-        self, action, scores, weights, variance, penalty, final_score
+        self,
+        action,
+        scores,
+        weights,
+        variance,
+        penalty,
+        final_score,
+        strategy=None,
     ):
         lines = []
         lines.append("\n=== DECISION TRACE ===")
@@ -302,8 +309,33 @@ class Agent:
             lines.append(
                 f"⚠️ conflict: variance={variance:.3f} → penalty={penalty:.3f}"
             )
+        if strategy:
+            lines.append(f"⚡ resolution strategy = {strategy}")
         lines.append(f"→ final_score = {final_score:.3f}")
         return "\n".join(lines)
+
+    def resolve_conflict(self, scores, weights, state, action):
+        variance = float(np.var(list(scores.values())))
+        if variance < 0.1:
+            return None
+        if variance > 0.5:
+            strategy = "conservative"
+        elif variance > 0.3:
+            strategy = "majority"
+        else:
+            strategy = "trusted"
+        if strategy == "conservative":
+            final = min(scores.values())
+        elif strategy == "majority":
+            sorted_scores = sorted(
+                scores.items(), key=lambda x: x[1], reverse=True
+            )
+            top2 = dict(sorted_scores[:2])
+            final = sum(weights[k] * top2[k] for k in top2)
+        else:
+            best_agent = max(weights.items(), key=lambda x: x[1])[0]
+            final = scores[best_agent]
+        return float(final), strategy, variance
 
     def debate(self, state):
         results = []
@@ -320,18 +352,26 @@ class Agent:
             }
             variance = None
             penalty = 0.0
+            strategy = None
             conflict, variance = self.detect_conflict(scores)
             if conflict:
                 best, worst = self.get_conflict_pair(scores)
                 print(self.build_conflict_message(best, worst))
-                penalty = variance * 0.3
             self.normalize_weights()
             weights = {
                 k: v["norm_weight"] for k, v in self.agent_stats.items()
             }
-            final_score = (
-                sum(weights[k] * scores[k] for k in scores) - penalty
+            resolved = self.resolve_conflict(
+                scores, weights, state, action
             )
+            if resolved:
+                final_score, strategy, variance = resolved
+                print(
+                    "⚡ Conflict resolved using: "
+                    f"{strategy} (variance={variance:.3f})"
+                )
+            else:
+                final_score = sum(weights[k] * scores[k] for k in scores)
             if self.debug_explain:
                 trace = self.build_explanation(
                     action=action,
@@ -340,6 +380,7 @@ class Agent:
                     variance=variance,
                     penalty=penalty,
                     final_score=final_score,
+                    strategy=strategy,
                 )
                 print(trace)
             results.append(
