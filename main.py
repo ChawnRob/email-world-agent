@@ -188,6 +188,12 @@ class Agent:
             "explorer": {"weight": 1.0, "score": 0.0},
             "critic": {"weight": 1.0, "score": 0.0},
         }
+        self.strategy_stats = {
+            "conservative": {"score": 1.0, "count": 1},
+            "majority": {"score": 1.0, "count": 1},
+            "trusted": {"score": 1.0, "count": 1},
+            "rollout": {"score": 1.0, "count": 1},
+        }
         self.debug_explain = True
         self.normalize_weights()
 
@@ -263,6 +269,19 @@ class Agent:
         variance = np.var(values)
         return variance > 0.1, float(variance)
 
+    def select_strategy(self):
+        scores = {
+            k: v["score"] / v["count"]
+            for k, v in self.strategy_stats.items()
+        }
+        vals = np.array(list(scores.values()), dtype=np.float64)
+        vals = vals - np.max(vals)
+        exp = np.exp(vals)
+        probs = exp / np.sum(exp)
+        keys = list(scores.keys())
+        strategy = np.random.choice(keys, p=probs)
+        return strategy, scores
+
     def get_conflict_pair(self, scores):
         sorted_agents = sorted(scores.items(), key=lambda x: x[1])
         worst = sorted_agents[0]
@@ -318,12 +337,7 @@ class Agent:
         variance = float(np.var(list(scores.values())))
         if variance < 0.1:
             return None
-        if variance > 0.5:
-            strategy = "conservative"
-        elif variance > 0.3:
-            strategy = "majority"
-        else:
-            strategy = "trusted"
+        strategy, strat_scores = self.select_strategy()
         if strategy == "conservative":
             final = min(scores.values())
         elif strategy == "majority":
@@ -332,10 +346,20 @@ class Agent:
             )
             top2 = dict(sorted_scores[:2])
             final = sum(weights[k] * top2[k] for k in top2)
-        else:
+        elif strategy == "trusted":
             best_agent = max(weights.items(), key=lambda x: x[1])[0]
             final = scores[best_agent]
-        return float(final), strategy, variance
+        else:
+            deep_score, _ = self.rollout(state, action, horizon=5)
+            final = 0.7 * max(scores.values()) + 0.3 * deep_score
+        return float(final), strategy, variance, strat_scores
+
+    def update_strategy_performance(self, strategy, real_reward):
+        if strategy not in self.strategy_stats:
+            return
+        stats = self.strategy_stats[strategy]
+        stats["score"] += float(real_reward)
+        stats["count"] += 1
 
     def debate(self, state):
         results = []
@@ -353,6 +377,7 @@ class Agent:
             variance = None
             penalty = 0.0
             strategy = None
+            strategy_scores = None
             conflict, variance = self.detect_conflict(scores)
             if conflict:
                 best, worst = self.get_conflict_pair(scores)
@@ -365,13 +390,17 @@ class Agent:
                 scores, weights, state, action
             )
             if resolved:
-                final_score, strategy, variance = resolved
+                final_score, strategy, variance, strategy_scores = resolved
+                print(
+                    f"⚡ Strategy chosen: {strategy}"
+                )
                 print(
                     "⚡ Conflict resolved using: "
                     f"{strategy} (variance={variance:.3f})"
                 )
             else:
                 final_score = sum(weights[k] * scores[k] for k in scores)
+                strategy = "none"
             if self.debug_explain:
                 trace = self.build_explanation(
                     action=action,
@@ -388,6 +417,8 @@ class Agent:
                     "action": action,
                     "scores": scores,
                     "final": final_score,
+                    "strategy": strategy,
+                    "strategy_scores": strategy_scores,
                 }
             )
         results.sort(key=lambda x: x["final"], reverse=True)
@@ -433,7 +464,7 @@ class Agent:
                 "explorer": self.explorer_score(state, action),
                 "critic": self.critic_score(state, action),
             }
-            chosen = (*chosen, predicted_scores)
+            chosen = (*chosen, predicted_scores, "exploration")
         else:
             debate_results = self.debate(state)
             print("\n--- DEBATE ---")
@@ -446,6 +477,7 @@ class Agent:
             action = best["action"]
             rollout_score, final_state = self.rollout(state, action)
             predicted_scores = best["scores"]
+            chosen_strategy = best.get("strategy", "none")
             chosen = (
                 action,
                 best["final"],
@@ -453,6 +485,7 @@ class Agent:
                 0,
                 final_state,
                 predicted_scores,
+                chosen_strategy,
             )
             mode = "debate"
         return chosen, mode
@@ -468,7 +501,9 @@ class Agent:
         self.optimizer.step()
         return loss.item()
 
-    def apply_feedback(self, state, action, predicted_scores):
+    def apply_feedback(
+        self, state, action, predicted_scores, chosen_strategy
+    ):
         next_state, reward = self.env.real_outcome(state, action)
         self.memory.add(state, action, next_state, reward)
         self.long_memory.update_stats(action, reward)
@@ -476,6 +511,7 @@ class Agent:
         if lesson:
             self.long_memory.store(lesson)
         self.update_agent_confidence(predicted_scores, reward)
+        self.update_strategy_performance(chosen_strategy, reward)
         return next_state, reward
 
 
@@ -490,9 +526,17 @@ if __name__ == "__main__":
     for epoch in range(30):
         state, _ = agent.env.reset()
         action_info, mode = agent.select_action(state)
-        action, _, rollout_score, uncertainty, _, predicted_scores = action_info
+        (
+            action,
+            _,
+            rollout_score,
+            uncertainty,
+            _,
+            predicted_scores,
+            chosen_strategy,
+        ) = action_info
         next_state, reward = agent.apply_feedback(
-            state, action, predicted_scores
+            state, action, predicted_scores, chosen_strategy
         )
         _ = agent.train_model(state, action, next_state)
         reward_f = float(reward)
@@ -524,3 +568,7 @@ if __name__ == "__main__":
             print(
                 f"{k}: weight={v['norm_weight']:.3f} score={v['score']:.3f}"
             )
+        print("=== STRATEGY STATS ===")
+        for k, v in agent.strategy_stats.items():
+            avg = v["score"] / v["count"]
+            print(f"{k}: avg={avg:.3f}, count={v['count']}")
