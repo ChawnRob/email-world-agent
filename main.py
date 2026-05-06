@@ -188,6 +188,7 @@ class Agent:
             "explorer": {"weight": 1.0, "score": 0.0},
             "critic": {"weight": 1.0, "score": 0.0},
         }
+        self.debug_explain = True
         self.normalize_weights()
 
     def normalize_weights(self):
@@ -279,6 +280,31 @@ class Agent:
             f"Δ divergence = {abs(best_score - worst_score):.3f}\n"
         )
 
+    def build_explanation(
+        self, action, scores, weights, variance, penalty, final_score
+    ):
+        lines = []
+        lines.append("\n=== DECISION TRACE ===")
+        lines.append(f"action = {action}")
+        for name, score in scores.items():
+            w = weights[name]
+            contrib = w * score
+            sign = "+" if contrib >= 0 else "-"
+            lines.append(
+                f"{sign} {name:<9}: score={score:.3f} × weight={w:.3f} "
+                f"→ contrib={contrib:.3f}"
+            )
+        if (
+            variance is not None
+            and penalty is not None
+            and penalty > 0
+        ):
+            lines.append(
+                f"⚠️ conflict: variance={variance:.3f} → penalty={penalty:.3f}"
+            )
+        lines.append(f"→ final_score = {final_score:.3f}")
+        return "\n".join(lines)
+
     def debate(self, state):
         results = []
         for action in range(self.env.action_dim):
@@ -292,26 +318,35 @@ class Agent:
                 "explorer": exp,
                 "critic": cri,
             }
+            variance = None
+            penalty = 0.0
             conflict, variance = self.detect_conflict(scores)
             if conflict:
                 best, worst = self.get_conflict_pair(scores)
-                msg = self.build_conflict_message(best, worst)
-                print(msg)
-            self.normalize_weights()
-            final = (
-                self.agent_stats["optimist"]["norm_weight"] * opt
-                + self.agent_stats["cautious"]["norm_weight"] * cau
-                + self.agent_stats["explorer"]["norm_weight"] * exp
-                + self.agent_stats["critic"]["norm_weight"] * cri
-            )
-            if conflict:
+                print(self.build_conflict_message(best, worst))
                 penalty = variance * 0.3
-                final -= penalty
+            self.normalize_weights()
+            weights = {
+                k: v["norm_weight"] for k, v in self.agent_stats.items()
+            }
+            final_score = (
+                sum(weights[k] * scores[k] for k in scores) - penalty
+            )
+            if self.debug_explain:
+                trace = self.build_explanation(
+                    action=action,
+                    scores=scores,
+                    weights=weights,
+                    variance=variance,
+                    penalty=penalty,
+                    final_score=final_score,
+                )
+                print(trace)
             results.append(
                 {
                     "action": action,
                     "scores": scores,
-                    "final": final,
+                    "final": final_score,
                 }
             )
         results.sort(key=lambda x: x["final"], reverse=True)
